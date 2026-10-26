@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "anycubic-slicer-mcp"
+version = "0.1.0"
+description = "MCP server that lets AI agents slice, inspect and preview prints with Anycubic Slicer Next"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "EmreTekir" }]
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.30,<2",
+    "pillow>=10",
+]
+keywords = ["mcp", "anycubic", "slicer", "3d-printing", "gcode", "claude"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Printing",
+]
+
+[project.urls]
+Homepage = "https://github.com/EmreTekir/anycubic-slicer-mcp"
+Issues = "https://github.com/EmreTekir/anycubic-slicer-mcp/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+anycubic-slicer-mcp = "anycubic_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["anycubic_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
