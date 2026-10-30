@@ -1,6 +1,7 @@
 # anycubic-slicer-mcp
 
 [![tests](https://github.com/EmreTekir/anycubic-slicer-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/EmreTekir/anycubic-slicer-mcp/actions/workflows/tests.yml)
+[![M8ven Score](https://m8ven.ai/badge/mcp/emretekir/anycubic-slicer-mcp)](https://m8ven.ai/mcp/emretekir/anycubic-slicer-mcp?s=readme)
 
 An [MCP](https://modelcontextprotocol.io) server that lets AI agents (Claude Code, Claude Desktop, Cursor, …)
 use **Anycubic Slicer Next** without its GUI: list presets, slice models, read print time and filament
@@ -73,7 +74,7 @@ With [uv](https://docs.astral.sh/uv/) you can skip the clone:
 | `list_presets` | Machine / process / filament presets, filtered to those compatible with a printer |
 | `get_preset` | Fully resolved preset (inheritance merged); `search` finds setting keys |
 | `model_info` | Size, bounding box, volume, facet count, manifold check |
-| `slice_model` | STL/3MF/OBJ/STEP → `.gcode` + `.gcode.3mf` with time, grams, meters, layers and warnings |
+| `slice_model` | STL/3MF/OBJ/STEP → `.gcode`, `.gcode.3mf` and an editable `_project.3mf`, with time, grams, meters, layers and warnings; multi-colour via `object_filaments` |
 | `gcode_summary` | The same estimates read from an existing `.gcode` |
 | `preview_gcode` | Top-down PNG: all layers shaded by height, or one layer colored by feature |
 | `open_in_slicer` | Open a file in the slicer GUI (only when you ask for it) |
@@ -84,6 +85,19 @@ Settings are changed with `overrides`, e.g.
 Each key is routed to the process, filament or machine config that owns it. Unknown keys are rejected,
 and the result lists `warnings` for values the slicer clamped or ignored (for example a bed temperature
 key that doesn't match the selected plate type).
+
+Multi-colour prints: give one model file per colour, the filaments, and which filament each model uses.
+Pass the colours of the loaded spools so the printer maps each filament to the right one:
+
+```json
+{"models": ["body.stl", "logo.stl"], "filaments": ["Anycubic PLA", "Anycubic PLA Matte"],
+ "object_filaments": [1, 2], "filament_colours": ["#FFFFFF", "#1E6FD9"]}
+```
+
+Each slice writes three files: `<name>.gcode`, `<name>.gcode.3mf` (G-code inside, for sending to the
+printer; the GUI shows it as a G-code preview) and `<name>_project.3mf` (no G-code, opens in the GUI as
+a project you can still edit). Overridden settings are recorded so the GUI keeps them instead of
+falling back to the preset values.
 
 Notes:
 - Filament names can be given naturally: with a printer selected, `"Anycubic PLA"` means

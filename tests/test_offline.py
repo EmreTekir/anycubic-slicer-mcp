@@ -282,6 +282,55 @@ def test_save_user_preset(data_dir):
             save("filament", name, "PLA @S1", settings)
 
 
+# ---- multi-filament projects --------------------------------------------------
+MODEL_SETTINGS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <object id="2"><metadata key="name" value="body.stl"/><metadata key="extruder" value="1"/></object>
+  <object id="4"><metadata key="name" value="logo.stl"/></object>
+</config>"""
+
+
+def test_assign_extruders():
+    out = slicer.assign_extruders(MODEL_SETTINGS, {"body.stl": 1, "logo.stl": 2}).decode()
+    assert out.count('key="extruder"') == 2 and 'value="2"' in out
+    with pytest.raises(RuntimeError, match="missing.stl"):
+        slicer.assign_extruders(MODEL_SETTINGS, {"missing.stl": 1})
+
+
+def test_set_colours():
+    cfgs = [{"default_filament_colour": [""]}, {}]
+    assert slicer.set_colours(cfgs, ["#FFFFFF"])  # second colour missing -> warning
+    assert cfgs[0]["filament_colour"] == ["#FFFFFF"] and cfgs[1]["filament_colour"][0] != "#FFFFFF"
+    single = [{"default_filament_colour": ["#00AA00"]}]
+    assert not slicer.set_colours(single, []) and single[0]["filament_colour"] == ["#00AA00"]
+
+
+def test_project_marking_and_editable_copy(tmp_path):
+    project = make_3mf(tmp_path, "p.gcode.3mf", {
+        "Metadata/project_settings.config": json.dumps({
+            "different_settings_to_system": ["wall_loops", "", "", ""],
+            "filament_colour": ["#FFFFFF", "#1E6FD9"], "filament_colour_info": ["#F2754E"]}).encode(),
+        "Metadata/plate_1.gcode": b"G1 X1", "Metadata/plate_1.gcode.md5": b"x",
+        "Metadata/slice_info.config": b"<config/>",
+        "Metadata/_rels/model_settings.config.rels":
+            b'<Relationships>\n <Relationship Target="/Metadata/plate_1.gcode" Id="rel-1" Type="t"/>\n</Relationships>',
+    })
+    slicer.mark_changed_settings(project, {"ironing_type": "process", "nozzle_temperature": "filament",
+                                           "z_hop": "machine"}, 2)
+    with zipfile.ZipFile(project) as archive:
+        cfg = json.loads(archive.read("Metadata/project_settings.config"))
+    assert cfg["different_settings_to_system"] == ["ironing_type;wall_loops", "nozzle_temperature",
+                                                   "nozzle_temperature", "z_hop"]
+    assert cfg["filament_colour_info"] == ["#FFFFFF", "#1E6FD9"]
+    editable = tmp_path / "p_project.3mf"
+    slicer.strip_gcode(project, editable)
+    with zipfile.ZipFile(editable) as archive:
+        names = archive.namelist()
+        rels = archive.read("Metadata/_rels/model_settings.config.rels")
+    assert not any(".gcode" in n or "slice_info" in n for n in names if not n.endswith(".rels"))
+    assert b"plate_1.gcode" not in rels and "3D/3dmodel.model" in names
+
+
 # ---- transforms --------------------------------------------------------------
 def binary_stl(path: Path, tris: list[tuple]) -> None:
     with path.open("wb") as fh:

@@ -12,6 +12,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+from xml.etree import ElementTree
 
 from .presets import EXE, PresetStore
 
@@ -30,6 +31,9 @@ ALLOW_NETWORK = os.environ.get("ANYCUBIC_MCP_ALLOW_NETWORK_PATHS") == "1"
 PROJECT_ENTRY_LIMIT = 20 * 1024 * 1024
 TRANSFORM_LIMIT = 200 * 1024 * 1024
 ACCESS_VIOLATION = -1073741819
+HEX_COLOUR = re.compile(r"#[0-9A-Fa-f]{6}")
+PLACEHOLDER_COLOURS = ("#F2754E", "#1E6FD9", "#3CB043", "#F4D03F", "#8E44AD", "#FFFFFF", "#2C2C2C", "#E91E63")
+GCODE_ENTRY = re.compile(r"Metadata/plate_\d+\.gcode(\.md5|\.metadata)?")
 # Which bed temperature key the slicer uses for each plate type.
 BED_KEYS = {
     "Cool Plate": "cool_plate_temp", "Engineering Plate": "eng_plate_temp", "High Temp Plate": "hot_plate_temp",
@@ -444,6 +448,106 @@ def override_warnings(overrides: dict, placed: dict, gcode: Path) -> list[str]:
 
 
 # ---- slicing ---------------------------------------------------------------
+def set_colours(filament_cfgs: list[dict], colours: list[str]) -> list[str]:
+    """Give every loaded filament its own colour; without one, all of them end up in a
+    one-element colour list and the GUI and printer treat the job as single-filament."""
+    for i, cfg in enumerate(filament_cfgs):
+        preset = cfg.get("default_filament_colour")
+        preset = preset[0] if isinstance(preset, list) and preset else preset
+        if i < len(colours):
+            colour = colours[i]
+        elif len(filament_cfgs) == 1 and isinstance(preset, str) and HEX_COLOUR.fullmatch(preset):
+            colour = preset
+        else:
+            colour = PLACEHOLDER_COLOURS[i % len(PLACEHOLDER_COLOURS)]
+        cfg["filament_colour"] = [colour]
+        cfg["default_filament_colour"] = [colour]
+    if len(filament_cfgs) > 1 and len(colours) < len(filament_cfgs):
+        return ["filament_colours not given for every filament; placeholder colours were used. Pass the "
+                "colours of the loaded spools so the printer maps each filament to the right one."]
+    return []
+
+
+def _rewrite_zip(src: Path, dst: Path, edit) -> None:
+    """Copy a 3MF entry by entry; edit(name, data) returns new bytes, or None to drop the entry."""
+    partial = dst.with_name(dst.name + ".tmp")
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as zout:
+        for entry in zin.infolist():
+            data = edit(entry.filename, zin.read(entry))
+            if data is not None:
+                zout.writestr(entry.filename, data)
+    os.replace(partial, dst)
+
+
+def assign_extruders(xml: bytes, by_name: dict[str, int]) -> bytes:
+    """Set the extruder of each object in Metadata/model_settings.config by its name."""
+    root = ElementTree.fromstring(xml)
+    found = set()
+    for obj in root.iter("object"):
+        meta = {m.get("key"): m for m in obj.findall("metadata")}
+        name = meta.get("name")
+        if name is None or name.get("value") not in by_name:
+            continue
+        ext = meta.get("extruder")
+        if ext is None:
+            ext = ElementTree.SubElement(obj, "metadata", key="extruder")
+        ext.set("value", str(by_name[name.get("value")]))
+        found.add(name.get("value"))
+    missing = sorted(set(by_name) - found)
+    if missing:
+        raise RuntimeError(f"Could not find {missing} in the laid-out project")
+    return b'<?xml version="1.0" encoding="UTF-8"?>\n' + ElementTree.tostring(root, encoding="utf-8")
+
+
+def _stage_objects(work: Path, settings: list[str], layout: list[str], local: list[str],
+                   object_filaments: list[int], timeout: int) -> str:
+    (work / "stage").mkdir()
+    code, log = run_cli(["--outputdir", "stage", *settings, "--export-3mf", "stage.3mf", *layout, *local],
+                        cwd=work, timeout=timeout)
+    laid_out = work / "stage" / "stage.3mf"
+    if code != 0 or not laid_out.exists():
+        raise RuntimeError(json.dumps({"exit_code": code, "stage": "layout",
+                                       "errors": cli_errors(log) or log[-1500:]}, ensure_ascii=False))
+    by_name = dict(zip(local, object_filaments))
+    _rewrite_zip(laid_out, work / "staged.3mf", lambda name, data: assign_extruders(data, by_name)
+                 if name == "Metadata/model_settings.config" else data)
+    return "staged.3mf"
+
+
+def mark_changed_settings(project: Path, placed: dict[str, str], filament_count: int) -> None:
+    """Record overridden keys in different_settings_to_system. The GUI loads the named presets
+    and only takes the keys listed there from the project, so overrides vanish otherwise."""
+    order = ["process", *(["filament"] * filament_count), "machine"]
+
+    def edit(name: str, data: bytes):
+        if name != "Metadata/project_settings.config":
+            return data
+        cfg = json.loads(data.decode("utf-8-sig"))
+        current = cfg.get("different_settings_to_system")
+        if not isinstance(current, list) or len(current) != len(order):
+            current = [""] * len(order)
+        cfg["different_settings_to_system"] = [
+            ";".join(sorted(set(filter(None, str(old).split(";"))) | {k for k, t in placed.items() if t == kind}))
+            for old, kind in zip(current, order)]
+        colours = cfg.get("filament_colour")
+        if isinstance(colours, list) and len(colours) == filament_count:
+            cfg["filament_colour_info"] = list(colours)
+        return json.dumps(cfg, indent=4, ensure_ascii=False).encode("utf-8")
+    _rewrite_zip(project, project, edit)
+
+
+def strip_gcode(project: Path, editable: Path) -> None:
+    """A copy without the sliced G-code, which the GUI opens as an editable project
+    instead of a G-code preview."""
+    def edit(name: str, data: bytes):
+        if GCODE_ENTRY.fullmatch(name) or name == "Metadata/slice_info.config":
+            return None
+        if name == "Metadata/_rels/model_settings.config.rels":
+            return re.sub(rb"\s*<Relationship [^>]*\.gcode\"[^>]*/>", b"", data)
+        return data
+    _rewrite_zip(project, editable, edit)
+
+
 def _output_stem(output_name: str | None, sources: list[Path]) -> str:
     stem = output_name or (sources[0].stem if len(sources) == 1 else "plate")
     stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem).strip(" .")
@@ -480,7 +584,8 @@ def slice_models(store: PresetStore, models: list[str], printer: str | None, pro
                  filaments: list[str] | None, overrides: dict | None, output_dir: str | None,
                  output_name: str | None, plate: int, arrange: bool, orient: bool,
                  scale: float | None, rotate_z: float | None, copies: int | None,
-                 use_project_settings: bool, timeout: int) -> dict:
+                 use_project_settings: bool, timeout: int, object_filaments: list[int] | None = None,
+                 filament_colours: list[str] | None = None) -> dict:
     if not models:
         raise ValueError("Give at least one model file")
     sources = [checked_file(m, MODEL_SUFFIXES) for m in models]
@@ -490,11 +595,19 @@ def slice_models(store: PresetStore, models: list[str], printer: str | None, pro
     for src in sources:
         check_project_scripts(src)
     if use_project_settings:
-        if overrides or printer or process or filaments:
-            raise ValueError("use_project_settings uses the 3MF's own settings; "
-                             "don't pass printer/process/filaments/overrides with it")
+        if overrides or printer or process or filaments or object_filaments or filament_colours:
+            raise ValueError("use_project_settings uses the 3MF's own settings; don't pass printer/process/"
+                             "filaments/overrides/object_filaments/filament_colours with it")
         if sources[0].suffix.lower() != ".3mf":
             raise ValueError("use_project_settings needs a .3mf project as the first model")
+    if object_filaments is not None:
+        if len(object_filaments) != len(sources):
+            raise ValueError("object_filaments needs one filament number per model, in the same order")
+        if any(s.suffix.lower() == ".3mf" for s in sources):
+            raise ValueError("object_filaments works with STL/OBJ/STEP/AMF models, not 3MF projects")
+    for colour in filament_colours or []:
+        if not isinstance(colour, str) or not HEX_COLOUR.fullmatch(colour):
+            raise ValueError(f"Filament colours must look like '#1E6FD9', got {colour!r}")
     transform = (scale not in (None, 1)) or bool(rotate_z)
     if transform:
         odd = [s.name for s in sources if s.suffix.lower() not in TRANSFORMABLE]
@@ -504,7 +617,7 @@ def slice_models(store: PresetStore, models: list[str], printer: str | None, pro
         raise ValueError("copies needs arrange=true; otherwise the copies overlap")
     dest = _local_path(output_dir) if output_dir else sources[0].parent
     stem = _output_stem(output_name, sources)
-    outputs = {(dest / f"{stem}.gcode").as_posix().lower(), (dest / f"{stem}.gcode.3mf").as_posix().lower()}
+    outputs = {(dest / f"{stem}{ext}").as_posix().lower() for ext in (".gcode", ".gcode.3mf", "_project.3mf")}
     clash = [s.name for s in sources if s.as_posix().lower() in outputs]
     if clash:
         raise ValueError(f"The output would overwrite the input {clash}; pass output_name or output_dir")
@@ -513,14 +626,14 @@ def slice_models(store: PresetStore, models: list[str], printer: str | None, pro
     try:
         return _slice_in(work, store, sources, printer, process, filaments, overrides or {}, dest,
                          output_name, plate, arrange, orient, scale or 1, rotate_z or 0, copies,
-                         use_project_settings, timeout)
+                         use_project_settings, timeout, object_filaments, filament_colours)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 def _slice_in(work: Path, store: PresetStore, sources: list[Path], printer, process, filaments,
               overrides: dict, dest: Path, output_name, plate, arrange, orient, scale, rotate_z,
-              copies, use_project_settings, timeout) -> dict:
+              copies, use_project_settings, timeout, object_filaments=None, filament_colours=None) -> dict:
     # Copy inputs so object names inside the gcode/3mf are clean file names.
     local = []
     for src in sources:
@@ -568,6 +681,11 @@ def _slice_in(work: Path, store: PresetStore, sources: list[Path], printer, proc
         configs["filament"] = filament_cfgs[0]
         placed = apply_overrides(configs, overrides, filament_cfgs[1:])
         warnings += temperature_warnings(store.resolve("filament", filaments[0]), overrides)
+        if object_filaments and any(not 1 <= n <= len(filaments) for n in object_filaments):
+            raise ValueError(f"object_filaments values must be between 1 and {len(filaments)} (the filaments given)")
+        if filament_colours and len(filament_colours) > len(filaments):
+            raise ValueError("More filament_colours than filaments")
+        warnings += set_colours(filament_cfgs, filament_colours or [])
 
         (work / "machine.json").write_text(json.dumps(configs["machine"], indent=1), encoding="utf-8")
         (work / "process.json").write_text(json.dumps(configs["process"], indent=1), encoding="utf-8")
@@ -576,21 +694,28 @@ def _slice_in(work: Path, store: PresetStore, sources: list[Path], printer, proc
             name = f"filament_{i}.json"
             (work / name).write_text(json.dumps(cfg, indent=1), encoding="utf-8")
             fil_files.append(name)
-        args += ["--load-settings", "machine.json;process.json", "--load-filaments", ";".join(fil_files)]
+        settings = ["--load-settings", "machine.json;process.json", "--load-filaments", ";".join(fil_files)]
+        args += settings
         resolved = {"printer": printer, "process": process, "filaments": filaments}
 
     stem = _output_stem(output_name, sources)
-    args += ["--export-3mf", f"{stem}.gcode.3mf"]
+    layout = []
     if rotate_z:
-        args.append("--allow-rotations=0")  # otherwise arrange turns the part back
-    args += ["--arrange", "1" if arrange else "0", "--orient", "1" if orient else "0", "--ensure-on-bed"]
+        layout.append("--allow-rotations=0")  # otherwise arrange turns the part back
+    layout += ["--arrange", "1" if arrange else "0", "--orient", "1" if orient else "0", "--ensure-on-bed"]
     if copies and copies > 1:
         # --repetitions is rejected with --slice 0; clone count is the total per object.
-        args += ["--clone-objects", ",".join([str(copies)] * len(local))]
-    args += local
+        layout += ["--clone-objects", ",".join([str(copies)] * len(local))]
 
     started = time.time()
     try:
+        if object_filaments:
+            # The CLI has no per-object filament option: lay the plate out into a project first,
+            # set each object's extruder in it, then slice that project with the same settings.
+            staged = _stage_objects(work, settings, layout, local, object_filaments, timeout)
+            args += ["--export-3mf", f"{stem}.gcode.3mf", "--arrange", "0", "--orient", "0", staged]
+        else:
+            args += ["--export-3mf", f"{stem}.gcode.3mf", *layout, *local]
         code, log = run_cli(args, cwd=work, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Slicing took longer than {timeout}s; raise timeout_s if the model is large") from exc
@@ -618,9 +743,18 @@ def _slice_in(work: Path, store: PresetStore, sources: list[Path], printer, proc
     project = out / f"{stem}.gcode.3mf"
     result = {"ok": True, "elapsed_s": elapsed, **resolved, "plates": plates}
     if project.exists():
+        if not use_project_settings:
+            mark_changed_settings(project, placed, len(filaments))
+        editable = work / f"{stem}_project.3mf"
+        strip_gcode(project, editable)
         target = dest / project.name
         _publish(project, target)
         result["project_3mf"] = str(target)
+        target = dest / editable.name
+        _publish(editable, target)
+        result["editable_3mf"] = str(target)
+    if object_filaments:
+        result["object_filaments"] = {name: n for name, n in zip(local, object_filaments)}
     if placed:
         result["overrides_applied"] = placed
         warnings += override_warnings(overrides, placed, gcodes[0])

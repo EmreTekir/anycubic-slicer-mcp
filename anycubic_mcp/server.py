@@ -133,10 +133,15 @@ def slice_model(models: list[str], printer: str | None = None, process: str | No
                 output_dir: str | None = None, output_name: str | None = None, plate: int = 0,
                 arrange: bool = True, orient: bool = False, scale: float | None = None,
                 rotate_z: float | None = None, copies: int | None = None,
-                use_project_settings: bool = False, timeout_s: int = 900) -> dict:
-    """Slice STL/3MF/OBJ/STEP files to G-code plus a .gcode.3mf project (openable in the GUI / sendable to the printer).
+                use_project_settings: bool = False, timeout_s: int = 900,
+                object_filaments: list[int] | None = None, filament_colours: list[str] | None = None) -> dict:
+    """Slice STL/3MF/OBJ/STEP files to G-code, a .gcode.3mf (G-code inside, sendable to the printer)
+    and a _project.3mf without G-code that the GUI opens as an editable project.
 
     printer/process/filaments: preset names or unique substrings; omitted -> GUI selection for that printer.
+    object_filaments: for multi-colour prints, the 1-based filament number of each model, in models order
+    (e.g. models=[body.stl, logo.stl], filaments=[white PLA, blue PLA], object_filaments=[1, 2]).
+    filament_colours: '#RRGGBB' per filament; give the loaded spools' colours so the printer maps them.
     overrides: setting key -> value, routed automatically to process/filament/machine
     (per-nozzle variants like nozzle_temperature_HS/_BRASS follow the plain key).
     output_dir defaults to the first model's folder; existing files with the same name are replaced.
@@ -152,7 +157,7 @@ def slice_model(models: list[str], printer: str | None = None, process: str | No
     store.reload()
     return slicer.slice_models(store, models, printer, process, filaments, overrides, output_dir,
                                output_name, plate, arrange, orient, scale, rotate_z, copies,
-                               use_project_settings, timeout_s)
+                               use_project_settings, timeout_s, object_filaments, filament_colours)
 
 
 @mcp.tool()
