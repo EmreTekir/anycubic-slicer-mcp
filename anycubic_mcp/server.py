@@ -215,7 +215,7 @@ def save_user_preset(kind: str, name: str, inherits: str, settings: dict) -> dic
         raise ValueError(f"{meta} describe the preset itself and cannot be set; use name/inherits instead")
     parent_cfg = store.resolve(kind, parent.name)
     slicer.check_setting_keys(settings)
-    unknown = [k for k in settings if k not in parent_cfg]
+    unknown = [k for k in settings if k not in parent_cfg and not slicer.slicer_knows(k)]
     if unknown:
         raise ValueError(f"Unknown setting keys {unknown}; look them up with get_preset(search=...)")
     data: dict = {"from": "User", "inherits": parent.name, "is_custom_defined": "0", "name": name,

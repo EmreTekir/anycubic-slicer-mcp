@@ -131,6 +131,22 @@ def test_apply_overrides_routes_and_syncs_variants():
         slicer.apply_overrides(configs, {"wal_loops": 3})
 
 
+def test_keys_missing_from_presets(tmp_path, monkeypatch):
+    (tmp_path / "AnycubicSlicer.dll").write_bytes(b"x\0ironing_inset\0y\0ironing_flow_extra\0")
+    monkeypatch.setattr(slicer, "EXE", tmp_path / "slicer.exe")
+    slicer.slicer_knows.cache_clear()
+    monkeypatch.setattr(slicer, "slicer_knows", slicer.slicer_knows.__wrapped__)
+    configs = {"process": {}, "machine": {}, "filament": {}}
+    assert slicer.apply_overrides(configs, {"ironing_inset": 0.21}) == {"ironing_inset": "process"}
+    assert configs["process"]["ironing_inset"] == "0.21"
+    for bad in ("ironing_flow", "ironing_ins", "not a key"):   # only whole names count
+        with pytest.raises(ValueError, match="Unknown"):
+            slicer.apply_overrides(configs, {bad: 1})
+    (tmp_path / "AnycubicSlicer.dll").unlink()
+    with pytest.raises(ValueError, match="Unknown"):
+        slicer.apply_overrides({"process": {}, "machine": {}, "filament": {}}, {"ironing_inset": 1})
+
+
 # ---- G-code reading --------------------------------------------------------
 GCODE = """; HEADER_BLOCK_START
 ; total layers count = 2

@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -32,6 +33,7 @@ PROJECT_ENTRY_LIMIT = 20 * 1024 * 1024
 TRANSFORM_LIMIT = 200 * 1024 * 1024
 ACCESS_VIOLATION = -1073741819
 HEX_COLOUR = re.compile(r"#[0-9A-Fa-f]{6}")
+SETTING_KEY = re.compile(r"[a-z][a-z0-9_]*")
 PLACEHOLDER_COLOURS = ("#F2754E", "#1E6FD9", "#3CB043", "#F4D03F", "#8E44AD", "#FFFFFF", "#2C2C2C", "#E91E63")
 GCODE_ENTRY = re.compile(r"Metadata/plate_\d+\.gcode(\.md5|\.metadata)?")
 # Which bed temperature key the slicer uses for each plate type.
@@ -110,6 +112,18 @@ def check_setting_keys(keys) -> None:
         if key.endswith("_gcode") and key != "emit_machine_limits_to_gcode" and not ALLOW_GCODE:
             raise ValueError(f"'{key}' is a raw G-code template; set ANYCUBIC_MCP_ALLOW_GCODE_TEMPLATES=1 "
                              f"in the server environment to allow editing it")
+
+
+@lru_cache(maxsize=256)
+def slicer_knows(key: str) -> bool:
+    """Valid settings can be missing from every preset file (ironing_inset), so a key the presets
+    don't list is checked against the setting names compiled into the slicer."""
+    if not SETTING_KEY.fullmatch(key):
+        return False
+    try:
+        return b"\0" + key.encode() + b"\0" in (EXE.parent / "AnycubicSlicer.dll").read_bytes()
+    except OSError:
+        return False
 
 
 def _decode(data: bytes) -> str:
@@ -401,17 +415,19 @@ def variant_keys(cfg: dict, key: str, given) -> list[str]:
 def apply_overrides(configs: dict[str, dict], overrides: dict, extra_filaments: list[dict] = ()) -> dict[str, str]:
     """Route each override to the config that owns the key; filament keys hit every loaded filament."""
     check_setting_keys(overrides)
-    unknown = [k for k in overrides if not any(k in configs[c] for c in ("process", "filament", "machine"))]
+    unknown = [k for k in overrides if not any(k in configs[c] for c in ("process", "filament", "machine"))
+               and not slicer_knows(k)]
     if unknown:
         raise ValueError(f"Unknown setting keys {unknown}; look them up with get_preset(search=...)")
     placed = {}
     for key, value in overrides.items():
-        target = next(k for k in ("process", "filament", "machine") if key in configs[k])
+        # Keys no preset lists are nearly all process settings; override_warnings reports it if not.
+        target = next((k for k in ("process", "filament", "machine") if key in configs[k]), "process")
         cfgs = [configs[target], *(extra_filaments if target == "filament" else ())]
         for k in [key, *variant_keys(configs[target], key, overrides)]:
             placed[k] = target
             for cfg in cfgs:
-                if k in cfg:
+                if k in cfg or k == key:
                     set_value(cfg, k, value)
     return placed
 
@@ -440,6 +456,8 @@ def override_warnings(overrides: dict, placed: dict, gcode: Path) -> list[str]:
     for key, value in overrides.items():
         if key in config and not _same(value, config[key]):
             warnings.append(f"{key}: requested {value!r} but the G-code has {config[key]!r}")
+        elif config and key not in config:
+            warnings.append(f"{key}: not in the G-code's settings, the slicer may have ignored it")
     bed_key = BED_KEYS.get(config.get("curr_bed_type", ""))
     for key in overrides:
         if key.endswith("plate_temp") and bed_key and key != bed_key:

@@ -82,7 +82,8 @@ With [uv](https://docs.astral.sh/uv/) you can skip the clone:
 
 Settings are changed with `overrides`, e.g.
 `{"sparse_infill_density": "20%", "enable_support": true, "brim_type": "outer_only", "nozzle_temperature": 215}`.
-Each key is routed to the process, filament or machine config that owns it. Unknown keys are rejected,
+Each key is routed to the process, filament or machine config that owns it. Valid keys that no preset
+lists (such as `ironing_inset`) go to the process config. Keys the slicer doesn't know are rejected,
 and the result lists `warnings` for values the slicer clamped or ignored (for example a bed temperature
 key that doesn't match the selected plate type).
 
